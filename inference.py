@@ -1,29 +1,34 @@
 """
 Inférence DeepLabV3+ - Prédiction sur nouvelles images
-Structure identique à Mask R-CNN pour comparaison
+Segmentation des toitures cadastrales
+
+Fonctionnalités:
+- Temps d'inférence par image
+- Résumé global pour les dossiers
+- Export des masques
+- Rapports JSON détaillés
 """
 
 import os
-import json
-import numpy as np
 import torch
 import torch.nn as nn
-from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_resnet101
-from torchvision.models.segmentation.deeplabv3 import DeepLabHead
-import torchvision.transforms.functional as TF
+import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from pathlib import Path
-from tqdm import tqdm
+import torchvision.transforms.functional as TF
+from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_resnet101
+from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 from scipy import ndimage
 import argparse
-import warnings
-warnings.filterwarnings('ignore')
+from pathlib import Path
+from datetime import datetime
+import time
+import json
 
 
 # =============================================================================
-# CONFIGURATION (identique à Mask R-CNN)
+# CONFIGURATION
 # =============================================================================
 
 CLASSES = [
@@ -35,6 +40,7 @@ CLASSES = [
 ]
 
 COLORS = {
+    "__background__": (0, 0, 0),
     "toiture_tole_ondulee": (255, 0, 0),
     "toiture_tole_bac": (0, 255, 0),
     "toiture_tuile": (0, 0, 255),
@@ -43,45 +49,45 @@ COLORS = {
 
 
 # =============================================================================
+# UTILITAIRES
+# =============================================================================
+
+def format_time(seconds):
+    if seconds < 1:
+        return f"{seconds*1000:.1f} ms"
+    elif seconds < 60:
+        return f"{seconds:.2f} s"
+    else:
+        return f"{int(seconds//60)}m {seconds%60:.1f}s"
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
 def get_model(num_classes, backbone="resnet50"):
-    """Créer le modèle DeepLabV3+"""
-    
     if backbone == "resnet50":
         model = deeplabv3_resnet50(weights=None)
-        in_channels = 2048
-    elif backbone == "resnet101":
+    else:
         model = deeplabv3_resnet101(weights=None)
-        in_channels = 2048
     
-    model.classifier = DeepLabHead(in_channels, num_classes)
-    
+    model.classifier = DeepLabHead(2048, num_classes)
     if model.aux_classifier is not None:
         model.aux_classifier = nn.Sequential(
             nn.Conv2d(1024, 256, 3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.BatchNorm2d(256), nn.ReLU(), nn.Dropout(0.1),
             nn.Conv2d(256, num_classes, 1)
         )
-    
     return model
 
 
 def load_model(checkpoint_path, device, backbone="resnet50"):
-    """Charger le modèle depuis un checkpoint"""
     model = get_model(len(CLASSES), backbone)
-    
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
-    
-    print(f"Modèle chargé depuis: {checkpoint_path}")
-    print(f"Epoch: {checkpoint.get('epoch', 'N/A')}, Loss: {checkpoint.get('loss', 'N/A'):.4f}")
-    
+    print(f"✅ Modèle chargé: {checkpoint_path}")
     return model
 
 
@@ -90,255 +96,258 @@ def load_model(checkpoint_path, device, backbone="resnet50"):
 # =============================================================================
 
 def predict(model, image_path, device, image_size=512):
-    """Prédire sur une image"""
-    
-    # Charger l'image
     image = Image.open(image_path).convert("RGB")
-    original_size = image.size  # (width, height)
+    original_size = image.size
     
-    # Redimensionner
     image_resized = image.resize((image_size, image_size), Image.BILINEAR)
-    
-    # Convertir en tensor
     image_tensor = TF.to_tensor(image_resized)
-    image_tensor = TF.normalize(image_tensor, 
-                                mean=[0.485, 0.456, 0.406], 
-                                std=[0.229, 0.224, 0.225])
+    image_tensor = TF.normalize(image_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     
-    # Inférence
+    start_time = time.time()
     with torch.no_grad():
         output = model(image_tensor.unsqueeze(0).to(device))
-        pred = output['out']
-        
-        # Probabilités
-        probs = torch.softmax(pred, dim=1)
-        confidence = probs.max(dim=1)[0].squeeze().cpu().numpy()
-        
-        # Classe prédite
-        pred_mask = torch.argmax(pred, dim=1).squeeze().cpu().numpy()
+        pred_mask = torch.argmax(output['out'], dim=1).squeeze().cpu().numpy()
+    inference_time = time.time() - start_time
     
-    # Redimensionner à la taille originale
     pred_pil = Image.fromarray(pred_mask.astype(np.uint8))
     pred_pil = pred_pil.resize(original_size, Image.NEAREST)
     pred_mask = np.array(pred_pil)
     
-    conf_pil = Image.fromarray((confidence * 255).astype(np.uint8))
-    conf_pil = conf_pil.resize(original_size, Image.BILINEAR)
-    confidence = np.array(conf_pil) / 255.0
-    
-    return image, pred_mask, confidence
+    return image, pred_mask, inference_time
 
 
 def extract_instances(pred_mask):
-    """
-    Extraire les instances (composantes connexes) du masque sémantique
-    Pour avoir un comportement similaire à Mask R-CNN
-    """
-    
     instances = []
-    
-    for class_id in range(1, len(CLASSES)):  # Ignorer background
+    for class_id in range(1, len(CLASSES)):
         binary_mask = (pred_mask == class_id).astype(np.uint8)
         labeled_array, num_features = ndimage.label(binary_mask)
         
         for i in range(1, num_features + 1):
             instance_mask = (labeled_array == i).astype(np.uint8)
-            
-            if instance_mask.sum() > 100:  # Ignorer les très petits objets
-                # Calculer la bounding box
+            if instance_mask.sum() > 100:
                 rows = np.any(instance_mask, axis=1)
                 cols = np.any(instance_mask, axis=0)
-                
                 if rows.any() and cols.any():
                     y1, y2 = np.where(rows)[0][[0, -1]]
                     x1, x2 = np.where(cols)[0][[0, -1]]
-                    
                     instances.append({
-                        'mask': instance_mask,
-                        'box': [x1, y1, x2 + 1, y2 + 1],
-                        'label': class_id,
-                        'class_name': CLASSES[class_id],
+                        'mask': instance_mask, 'box': [x1, y1, x2+1, y2+1],
+                        'class_id': class_id, 'class_name': CLASSES[class_id],
                         'surface_px': int(instance_mask.sum())
                     })
-    
     return instances
 
 
-def calculate_surface(mask, pixel_size_m2=None):
-    """Calculer la surface d'un masque"""
-    surface_pixels = np.sum(mask > 0)
-    
-    if pixel_size_m2 is not None:
-        return surface_pixels * pixel_size_m2
-    return surface_pixels
-
-
 # =============================================================================
-# VISUALISATION (identique à Mask R-CNN)
+# VISUALISATION
 # =============================================================================
 
-def visualize_predictions(image, pred_mask, instances, output_path=None, show=True):
-    """Visualiser les prédictions avec masques et boîtes (comme Mask R-CNN)"""
+def visualize_predictions(image, pred_mask, instances, inference_time, output_path=None, show=True):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    
-    # Image originale
     axes[0].imshow(image)
     axes[0].set_title("Image originale")
     axes[0].axis('off')
     
-    # Image avec prédictions
-    axes[1].imshow(image)
+    colored_mask = np.zeros((*pred_mask.shape, 3), dtype=np.uint8)
+    for class_id, class_name in enumerate(CLASSES):
+        color = COLORS.get(class_name, (128, 128, 128))
+        colored_mask[pred_mask == class_id] = color
+    axes[1].imshow(colored_mask)
+    axes[1].set_title("Segmentation sémantique")
+    axes[1].axis('off')
     
-    # Overlay des masques
+    axes[2].imshow(image)
     overlay = np.zeros((*np.array(image).shape[:2], 4))
     
     for inst in instances:
-        class_name = inst['class_name']
-        color = COLORS.get(class_name, (128, 128, 128))
-        color_normalized = [c/255 for c in color]
-        
+        color = COLORS.get(inst['class_name'], (128, 128, 128))
+        color_norm = [c/255 for c in color]
         mask = inst['mask']
-        box = inst['box']
+        if mask.shape[:2] != overlay.shape[:2]:
+            mask = np.array(Image.fromarray(mask.astype(np.uint8)).resize(
+                (overlay.shape[1], overlay.shape[0]), Image.NEAREST))
+        overlay[mask > 0] = [*color_norm, 0.5]
         
-        # Masque
-        overlay[mask > 0] = [*color_normalized, 0.5]
-        
-        # Boîte
-        x1, y1, x2, y2 = box
-        rect = patches.Rectangle(
-            (x1, y1), x2-x1, y2-y1,
-            linewidth=2,
-            edgecolor=color_normalized,
-            facecolor='none'
-        )
-        axes[1].add_patch(rect)
-        
-        # Label
-        surface = inst['surface_px']
-        label_text = f"{class_name}\n{surface:,} px"
-        axes[1].text(
-            x1, y1-10,
-            label_text,
-            fontsize=8,
-            color='white',
-            bbox=dict(boxstyle='round', facecolor=color_normalized, alpha=0.8)
-        )
+        x1, y1, x2, y2 = inst['box']
+        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2,
+                                  edgecolor=color_norm, facecolor='none')
+        axes[2].add_patch(rect)
+        axes[2].text(x1, y1-5, f"{inst['class_name']}\n{inst['surface_px']:,} px",
+                     fontsize=8, color='white',
+                     bbox=dict(boxstyle='round', facecolor=color_norm, alpha=0.8))
     
-    axes[1].imshow(overlay)
-    axes[1].set_title(f"Prédictions ({len(instances)} objets détectés)")
-    axes[1].axis('off')
+    axes[2].imshow(overlay)
+    axes[2].set_title(f"Instances ({len(instances)} objets) | ⏱️ {format_time(inference_time)}")
+    axes[2].axis('off')
     
     plt.tight_layout()
-    
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Résultat sauvegardé: {output_path}")
-    
     if show:
         plt.show()
-    
     plt.close()
 
 
-def generate_report(instances, image_name):
-    """Générer un rapport des surfaces détectées (identique à Mask R-CNN)"""
-    
+def export_masks(pred_mask, instances, output_dir, image_name):
+    os.makedirs(output_dir, exist_ok=True)
+    Image.fromarray(pred_mask.astype(np.uint8)).save(os.path.join(output_dir, "semantic_mask.png"))
+    for i, inst in enumerate(instances):
+        mask = (inst['mask'] > 0).astype(np.uint8) * 255
+        Image.fromarray(mask).save(os.path.join(output_dir, f"{i:02d}_{inst['class_name']}.png"))
+
+
+def generate_report(instances, image_name, inference_time):
     report = {
         'image': image_name,
+        'timestamp': datetime.now().isoformat(),
+        'inference_time_ms': inference_time * 1000,
         'total_objects': len(instances),
-        'surfaces_by_class': {},
+        'surfaces_by_class': {c: {'count': 0, 'total_surface_px': 0} for c in CLASSES[1:]},
         'details': []
     }
     
-    for class_name in CLASSES[1:]:
-        report['surfaces_by_class'][class_name] = {
-            'count': 0,
-            'total_surface_px': 0
-        }
-    
     for i, inst in enumerate(instances):
-        class_name = inst['class_name']
-        surface = inst['surface_px']
-        
-        report['surfaces_by_class'][class_name]['count'] += 1
-        report['surfaces_by_class'][class_name]['total_surface_px'] += surface
-        
+        report['surfaces_by_class'][inst['class_name']]['count'] += 1
+        report['surfaces_by_class'][inst['class_name']]['total_surface_px'] += inst['surface_px']
         report['details'].append({
-            'id': i,
-            'class': class_name,
-            'surface_px': surface,
-            'bbox': inst['box']
+            'id': i, 'class': inst['class_name'],
+            'surface_px': inst['surface_px'], 'bbox': inst['box']
         })
-    
     return report
 
 
-def print_report(report):
-    """Afficher le rapport (identique à Mask R-CNN)"""
-    print("\n" + "=" * 50)
-    print(f"RAPPORT DE SEGMENTATION - {report['image']}")
-    print("=" * 50)
-    print(f"Total objets détectés: {report['total_objects']}")
-    print("\nSurfaces par classe:")
-    print("-" * 50)
+# =============================================================================
+# RÉSUMÉ GLOBAL
+# =============================================================================
+
+def generate_summary(all_reports, output_dir, total_processing_time):
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'model': 'DeepLabV3+',
+        'total_images': len(all_reports),
+        'total_processing_time_s': total_processing_time,
+        'avg_inference_time_ms': 0,
+        'total_objects': 0,
+        'objects_by_class': {c: 0 for c in CLASSES[1:]},
+        'surfaces_by_class': {c: 0 for c in CLASSES[1:]},
+        'per_image_stats': []
+    }
     
-    for class_name, data in report['surfaces_by_class'].items():
-        if data['count'] > 0:
-            print(f"  {class_name}:")
-            print(f"    - Nombre: {data['count']}")
-            print(f"    - Surface totale: {data['total_surface_px']:,} pixels")
+    total_inference_time = 0
+    for report in all_reports:
+        total_inference_time += report['inference_time_ms']
+        summary['total_objects'] += report['total_objects']
+        for class_name, data in report['surfaces_by_class'].items():
+            summary['objects_by_class'][class_name] += data['count']
+            summary['surfaces_by_class'][class_name] += data['total_surface_px']
+        summary['per_image_stats'].append({
+            'image': report['image'],
+            'objects': report['total_objects'],
+            'inference_time_ms': report['inference_time_ms']
+        })
     
-    print("\nDétails:")
-    print("-" * 50)
-    for obj in report['details']:
-        print(f"  [{obj['id']}] {obj['class']} - {obj['surface_px']:,} px")
+    summary['avg_inference_time_ms'] = total_inference_time / len(all_reports) if all_reports else 0
     
-    print("=" * 50)
+    with open(os.path.join(output_dir, "summary.json"), 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    
+    total_surface = sum(summary['surfaces_by_class'].values())
+    with open(os.path.join(output_dir, "summary.txt"), 'w', encoding='utf-8') as f:
+        f.write("=" * 70 + "\n")
+        f.write("   RÉSUMÉ D'INFÉRENCE - DEEPLABV3+ CADASTRAL\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"📅 Date: {summary['timestamp']}\n")
+        f.write(f"🖼️  Images traitées: {summary['total_images']}\n")
+        f.write(f"⏱️  Temps total: {format_time(summary['total_processing_time_s'])}\n")
+        f.write(f"⏱️  Temps moyen/image: {summary['avg_inference_time_ms']:.1f} ms\n")
+        f.write(f"🎯 Total objets: {summary['total_objects']}\n\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'Classe':<25} {'Objets':>10} {'Surface (px)':>15} {'%':>10}\n")
+        f.write("-" * 70 + "\n")
+        for class_name in CLASSES[1:]:
+            count = summary['objects_by_class'][class_name]
+            surface = summary['surfaces_by_class'][class_name]
+            pct = (surface / total_surface * 100) if total_surface > 0 else 0
+            f.write(f"{class_name:<25} {count:>10} {surface:>15,} {pct:>9.1f}%\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'TOTAL':<25} {summary['total_objects']:>10} {total_surface:>15,} {'100.0%':>10}\n")
+        f.write("\n" + "-" * 70 + "\n")
+        f.write("DÉTAILS PAR IMAGE\n" + "-" * 70 + "\n")
+        f.write(f"{'Image':<40} {'Objets':>10} {'Temps (ms)':>15}\n")
+        f.write("-" * 70 + "\n")
+        for stat in summary['per_image_stats']:
+            img_name = stat['image'][:38] + '..' if len(stat['image']) > 40 else stat['image']
+            f.write(f"{img_name:<40} {stat['objects']:>10} {stat['inference_time_ms']:>15.1f}\n")
+        f.write("=" * 70 + "\n")
+    
+    return summary
+
+
+def print_summary(summary):
+    print("\n" + "=" * 70)
+    print("   📊 RÉSUMÉ GLOBAL - DEEPLABV3+")
+    print("=" * 70)
+    print(f"\n   🖼️  Images traitées:     {summary['total_images']}")
+    print(f"   ⏱️  Temps total:          {format_time(summary['total_processing_time_s'])}")
+    print(f"   ⏱️  Temps moyen/image:    {summary['avg_inference_time_ms']:.1f} ms")
+    print(f"   🎯 Total objets:         {summary['total_objects']}")
+    
+    total_surface = sum(summary['surfaces_by_class'].values())
+    print(f"\n   📋 Par classe:")
+    for class_name in CLASSES[1:]:
+        count = summary['objects_by_class'][class_name]
+        surface = summary['surfaces_by_class'][class_name]
+        pct = (surface / total_surface * 100) if total_surface > 0 else 0
+        if count > 0:
+            print(f"      • {class_name}: {count} objets | {surface:,} px ({pct:.1f}%)")
+    print("\n" + "=" * 70)
 
 
 # =============================================================================
 # BATCH PROCESSING
 # =============================================================================
 
-def process_directory(model, input_dir, output_dir, device, image_size=512):
-    """Traiter toutes les images d'un répertoire"""
-    
+def process_directory(model, input_dir, output_dir, device, image_size=512, export_masks_flag=False):
     os.makedirs(output_dir, exist_ok=True)
     
-    image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-    image_paths = [
-        p for p in Path(input_dir).iterdir()
-        if p.suffix.lower() in image_extensions
-    ]
+    image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
+    image_paths = sorted([p for p in Path(input_dir).iterdir() if p.suffix.lower() in image_extensions])
     
-    print(f"\nTraitement de {len(image_paths)} images...")
+    if not image_paths:
+        print(f"❌ Aucune image trouvée dans {input_dir}")
+        return []
+    
+    print(f"\n🖼️  {len(image_paths)} images à traiter\n")
     
     all_reports = []
+    start_total = time.time()
     
-    for img_path in tqdm(image_paths, desc="Inférence"):
-        # Prédiction
-        image, pred_mask, confidence = predict(model, str(img_path), device, image_size)
+    for idx, img_path in enumerate(image_paths, 1):
+        print(f"[{idx}/{len(image_paths)}] 🔍 {img_path.name}")
         
-        # Extraire les instances
+        image, pred_mask, inference_time = predict(model, str(img_path), device, image_size)
         instances = extract_instances(pred_mask)
         
-        # Visualisation
         output_path = os.path.join(output_dir, f"{img_path.stem}_pred.png")
-        visualize_predictions(image, pred_mask, instances, output_path, show=False)
+        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=False)
         
-        # Rapport
-        report = generate_report(instances, img_path.name)
+        if export_masks_flag:
+            export_masks(pred_mask, instances, os.path.join(output_dir, "masks", img_path.stem), img_path.stem)
+        
+        report = generate_report(instances, img_path.name, inference_time)
         all_reports.append(report)
-        print_report(report)
+        print(f"   ✅ {report['total_objects']} objets | ⏱️ {report['inference_time_ms']:.1f} ms")
     
-    # Sauvegarder tous les rapports
-    reports_path = os.path.join(output_dir, "reports.json")
-    with open(reports_path, 'w') as f:
-        json.dump(all_reports, f, indent=2)
+    total_processing_time = time.time() - start_total
     
-    print(f"\nRapports sauvegardés: {reports_path}")
+    with open(os.path.join(output_dir, "reports.json"), 'w', encoding='utf-8') as f:
+        json.dump(all_reports, f, indent=2, ensure_ascii=False)
     
+    summary = generate_summary(all_reports, output_dir, total_processing_time)
+    print_summary(summary)
+    
+    print(f"\n📁 Résultats sauvegardés dans: {output_dir}")
     return all_reports
 
 
@@ -348,37 +357,48 @@ def process_directory(model, input_dir, output_dir, device, image_size=512):
 
 def main():
     parser = argparse.ArgumentParser(description="Inférence DeepLabV3+ Cadastral")
-    parser.add_argument("--model", type=str, required=True, help="Chemin vers le checkpoint")
-    parser.add_argument("--input", type=str, required=True, help="Image ou dossier d'images")
-    parser.add_argument("--output", type=str, default="./predictions", help="Dossier de sortie")
-    parser.add_argument("--backbone", type=str, default="resnet50", help="Backbone: resnet50, resnet101")
-    parser.add_argument("--image-size", type=int, default=512, help="Taille des images")
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--input", type=str, required=True)
+    parser.add_argument("--output", type=str, default="./predictions")
+    parser.add_argument("--backbone", type=str, default="resnet50")
+    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--export-masks", action="store_true")
+    parser.add_argument("--no-display", action="store_true")
     
     args = parser.parse_args()
     
-    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    print(f"📱 Device: {device}")
     
-    # Charger le modèle
     model = load_model(args.model, device, args.backbone)
-    
-    # Traitement
     input_path = Path(args.input)
     
     if input_path.is_dir():
-        process_directory(model, str(input_path), args.output, device, args.image_size)
+        process_directory(model, str(input_path), args.output, device, args.image_size, args.export_masks)
     else:
         os.makedirs(args.output, exist_ok=True)
+        print(f"\n🔍 Traitement: {input_path.name}")
         
-        image, pred_mask, confidence = predict(model, str(input_path), device, args.image_size)
+        image, pred_mask, inference_time = predict(model, str(input_path), device, args.image_size)
         instances = extract_instances(pred_mask)
         
         output_path = os.path.join(args.output, f"{input_path.stem}_pred.png")
-        visualize_predictions(image, pred_mask, instances, output_path)
+        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=not args.no_display)
         
-        report = generate_report(instances, input_path.name)
-        print_report(report)
+        if args.export_masks:
+            export_masks(pred_mask, instances, os.path.join(args.output, "masks"), input_path.stem)
+        
+        report = generate_report(instances, input_path.name, inference_time)
+        print(f"\n{'='*60}")
+        print(f"📊 RAPPORT - {report['image']}")
+        print(f"   ⏱️  Temps: {report['inference_time_ms']:.1f} ms | 🎯 Objets: {report['total_objects']}")
+        for class_name, data in report['surfaces_by_class'].items():
+            if data['count'] > 0:
+                print(f"      • {class_name}: {data['count']} objets, {data['total_surface_px']:,} px")
+        print(f"{'='*60}")
+        
+        with open(os.path.join(args.output, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
