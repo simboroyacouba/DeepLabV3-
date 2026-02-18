@@ -99,12 +99,29 @@ def get_model(num_classes, backbone="resnet50"):
 
 
 def load_model(checkpoint_path, device, backbone="resnet50"):
-    model = get_model(len(CLASSES), backbone)
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Détecter automatiquement si le checkpoint a un aux_classifier
+    has_aux = any(k.startswith('aux_classifier') for k in checkpoint['model_state_dict'].keys())
+    
+    model = get_model(len(CLASSES), backbone)
+    
+    if has_aux and model.aux_classifier is None:
+        model.aux_classifier = nn.Sequential(
+            nn.Conv2d(1024, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Conv2d(256, len(CLASSES), 1)
+        )
+    
     model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # ← AJOUT : supprimer aux_classifier pour l'inférence
+    # Il n'est utilisé qu'à l'entraînement, cause KeyError 'aux' à l'inférence
+    model.aux_classifier = None
+    
     model.to(device)
     model.eval()
-    print(f"✅ Modèle chargé: {checkpoint_path}")
+    print(f"✅ Modèle chargé: {checkpoint_path} (aux_loss={has_aux})")
     return model
 
 
@@ -228,8 +245,10 @@ def generate_report(instances, image_name, inference_time):
         report['surfaces_by_class'][inst['class_name']]['count'] += 1
         report['surfaces_by_class'][inst['class_name']]['total_surface_px'] += inst['surface_px']
         report['details'].append({
-            'id': i, 'class': inst['class_name'],
-            'surface_px': inst['surface_px'], 'bbox': inst['box']
+            'id': i,
+            'class': inst['class_name'],
+            'surface_px': inst['surface_px'],
+            'bbox': [int(x) for x in inst['box']]  # ← convertir numpy.int64 en int Python
         })
     return report
 

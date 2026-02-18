@@ -1,5 +1,6 @@
 # DEEPLAB outputs
 evaluation/
 output/
+predictions/
 *.pt
 *.pth
