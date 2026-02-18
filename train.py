@@ -34,8 +34,8 @@ warnings.filterwarnings('ignore')
 
 CONFIG = {
     # Chemins (à adapter)
-    "images_dir": "../dataset1/images/default",
-    "annotations_file": "../dataset1/annotations/instances_default.json",
+    "images_dir": os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
+    "annotations_file": os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
     "output_dir": "./output",
     
     # Classes (dans l'ordre de CVAT) - IDENTIQUE à Mask R-CNN

@@ -210,11 +210,12 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Vérifier le dataset CVAT")
-    parser.add_argument("--images", type=str, default="../dataset1/images/default",
-                       help="Dossier des images")
+    parser.add_argument("--images", type=str, 
+                    default=os.getenv("SEGMENTATION_DATASET_IMAGES_DIR"),
+                    help="Dossier des images")
     parser.add_argument("--annotations", type=str, 
-                       default="../dataset1/annotations/instances_default.json",
-                       help="Fichier d'annotations COCO")
+                    default=os.getenv("SEGMENTATION_DATASET_ANNOTATIONS_FILE"),
+                    help="Fichier d'annotations COCO JSON")
     parser.add_argument("--visualize", action="store_true",
                        help="Visualiser des échantillons")
     parser.add_argument("--num-samples", type=int, default=3,
