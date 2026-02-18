@@ -10,6 +10,11 @@ Fonctionnalités:
 """
 
 import os
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement
+load_dotenv()
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -20,7 +25,6 @@ import torchvision.transforms.functional as TF
 from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_resnet101
 from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 from scipy import ndimage
-import argparse
 from pathlib import Path
 from datetime import datetime
 import time
@@ -45,6 +49,16 @@ COLORS = {
     "toiture_tole_bac": (0, 255, 0),
     "toiture_tuile": (0, 0, 255),
     "toiture_dalle": (255, 165, 0),
+}
+
+CONFIG = {
+    "model_path": os.getenv("SEGMENTATION_MODEL_PATH", "./output/best_model.pth"),
+    "input_dir": os.getenv("SEGMENTATION_TEST_IMAGES_DIR", "./test_images"),
+    "output_dir": os.getenv("SEGMENTATION_OUTPUT_DIR", "./predictions"),
+    "backbone": os.getenv("SEGMENTATION_BACKBONE", "resnet50"),
+    "image_size": 512,
+    "export_masks": False,
+    "show_display": False,
 }
 
 
@@ -308,7 +322,7 @@ def print_summary(summary):
 # BATCH PROCESSING
 # =============================================================================
 
-def process_directory(model, input_dir, output_dir, device, image_size=512, export_masks_flag=False):
+def process_directory(model, input_dir, output_dir, device, image_size=512, export_masks_flag=False, show_display=False):
     os.makedirs(output_dir, exist_ok=True)
     
     image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'}
@@ -330,7 +344,7 @@ def process_directory(model, input_dir, output_dir, device, image_size=512, expo
         instances = extract_instances(pred_mask)
         
         output_path = os.path.join(output_dir, f"{img_path.stem}_pred.png")
-        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=False)
+        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=show_display)
         
         if export_masks_flag:
             export_masks(pred_mask, instances, os.path.join(output_dir, "masks", img_path.stem), img_path.stem)
@@ -356,48 +370,70 @@ def process_directory(model, input_dir, output_dir, device, image_size=512, expo
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Inférence DeepLabV3+ Cadastral")
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--input", type=str, required=True)
-    parser.add_argument("--output", type=str, default="./predictions")
-    parser.add_argument("--backbone", type=str, default="resnet50")
-    parser.add_argument("--image-size", type=int, default=512)
-    parser.add_argument("--export-masks", action="store_true")
-    parser.add_argument("--no-display", action="store_true")
+    # Configuration depuis variables d'environnement
+    model_path = CONFIG["model_path"]
+    input_dir = CONFIG["input_dir"]
+    output_dir = CONFIG["output_dir"]
+    backbone = CONFIG["backbone"]
+    image_size = CONFIG["image_size"]
+    export_masks_flag = CONFIG["export_masks"]
+    show_display = CONFIG["show_display"]
     
-    args = parser.parse_args()
+    # Vérifications
+    if not os.path.exists(model_path):
+        print(f"❌ Modèle non trouvé: {model_path}")
+        print(f"   Définissez SEGMENTATION_MODEL_PATH")
+        return
+    
+    if not os.path.exists(input_dir):
+        print(f"❌ Dossier d'images non trouvé: {input_dir}")
+        print(f"   Définissez SEGMENTATION_TEST_IMAGES_DIR")
+        return
+    
+    print("=" * 70)
+    print("   🚀 INFÉRENCE DEEPLABV3+ CADASTRAL")
+    print("=" * 70)
+    print(f"\n📂 Configuration:")
+    print(f"   • Modèle:      {model_path}")
+    print(f"   • Backbone:    {backbone}")
+    print(f"   • Images:      {input_dir}")
+    print(f"   • Sortie:      {output_dir}")
+    print(f"   • Image size:  {image_size}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"📱 Device: {device}")
+    print(f"   • Device:      {device}")
     
-    model = load_model(args.model, device, args.backbone)
-    input_path = Path(args.input)
+    model = load_model(model_path, device, backbone)
+    
+    input_path = Path(input_dir)
     
     if input_path.is_dir():
-        process_directory(model, str(input_path), args.output, device, args.image_size, args.export_masks)
+        process_directory(model, str(input_path), output_dir, device, image_size, export_masks_flag, show_display)
     else:
-        os.makedirs(args.output, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         print(f"\n🔍 Traitement: {input_path.name}")
         
-        image, pred_mask, inference_time = predict(model, str(input_path), device, args.image_size)
+        image, pred_mask, inference_time = predict(model, str(input_path), device, image_size)
         instances = extract_instances(pred_mask)
         
-        output_path = os.path.join(args.output, f"{input_path.stem}_pred.png")
-        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=not args.no_display)
+        output_path = os.path.join(output_dir, f"{input_path.stem}_pred.png")
+        visualize_predictions(image, pred_mask, instances, inference_time, output_path, show=show_display)
         
-        if args.export_masks:
-            export_masks(pred_mask, instances, os.path.join(args.output, "masks"), input_path.stem)
+        if export_masks_flag:
+            export_masks(pred_mask, instances, os.path.join(output_dir, "masks"), input_path.stem)
         
         report = generate_report(instances, input_path.name, inference_time)
         print(f"\n{'='*60}")
         print(f"📊 RAPPORT - {report['image']}")
-        print(f"   ⏱️  Temps: {report['inference_time_ms']:.1f} ms | 🎯 Objets: {report['total_objects']}")
+        print(f"{'='*60}")
+        print(f"   ⏱️  Temps d'inférence: {report['inference_time_ms']:.1f} ms")
+        print(f"   🎯 Objets détectés: {report['total_objects']}")
         for class_name, data in report['surfaces_by_class'].items():
             if data['count'] > 0:
                 print(f"      • {class_name}: {data['count']} objets, {data['total_surface_px']:,} px")
         print(f"{'='*60}")
         
-        with open(os.path.join(args.output, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
+        with open(os.path.join(output_dir, f"{input_path.stem}_report.json"), 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
 
