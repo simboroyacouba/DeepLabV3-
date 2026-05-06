@@ -40,9 +40,7 @@ def load_classes(yaml_path=None):
     path = yaml_path or os.getenv("CLASSES_FILE", "classes.yaml")
     with open(path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
-    # YOLO n'utilise pas __background__, on le retire
-    classes = data['classes']
-    return [c for c in classes if c != '__background__']
+    return data['classes'] 
 
 
 CONFIG = {
@@ -188,17 +186,33 @@ def get_model(num_classes, backbone="resnet50"):
 
 
 def load_model(model_path, num_classes, backbone, device):
-    """Charger le modèle entraîné"""
+    checkpoint = torch.load(model_path, map_location=device)
+    state_dict = checkpoint['model_state_dict']
+    
+    # ✅ Détecter num_classes depuis le checkpoint
+    detected_classes = state_dict['classifier.4.weight'].shape[0]
+    if detected_classes != num_classes:
+        print(f"⚠️ num_classes corrigé: {num_classes} → {detected_classes}")
+        num_classes = detected_classes
+    
+    # ✅ Détecter aux_classifier
+    has_aux = any(k.startswith('aux_classifier') for k in state_dict.keys())
+    
     model = get_model(num_classes, backbone)
     
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if has_aux and model.aux_classifier is None:
+        model.aux_classifier = nn.Sequential(
+            nn.Conv2d(1024, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Conv2d(256, num_classes, 1)
+        )
+    
+    model.load_state_dict(state_dict)
+    model.aux_classifier = None  # inutile à l'évaluation
     model.to(device)
     model.eval()
     
-    print(f"Modèle chargé: {model_path}")
-    print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
-    
+    print(f"✅ Modèle chargé: {model_path} (epoch={checkpoint.get('epoch', 'N/A')}, aux={has_aux})")
     return model
 
 
@@ -242,58 +256,58 @@ def extract_connected_components(semantic_mask, class_id):
     return instances
 
 
+def calculate_ap(recalls, precisions):
+    """Calculer AP = aire sous la courbe Precision-Recall (interpolation continue)."""
+    recalls = np.concatenate([[0.0], recalls, [1.0]])
+    precisions = np.concatenate([[0.0], precisions, [0.0]])
+    for i in range(len(precisions) - 2, -1, -1):
+        precisions[i] = max(precisions[i], precisions[i + 1])
+    indices = np.where(recalls[1:] != recalls[:-1])[0] + 1
+    ap = np.sum((recalls[indices] - recalls[indices - 1]) * precisions[indices])
+    return float(ap)
+
+
 class MetricsCalculator:
     """
-    Classe pour calculer toutes les métriques
-    IDENTIQUE à Mask R-CNN pour comparaison équitable
+    Calcule le vrai mAP (mean Average Precision) = moyenne de l'AP
+    (aire sous la courbe Precision-Recall) par classe et par seuil IoU.
+    Pour DeepLab, l'aire de la composante connexe sert de proxy de score de confiance.
     """
-    
+
     def __init__(self, num_classes, class_names, iou_thresholds):
         self.num_classes = num_classes
         self.class_names = class_names
         self.iou_thresholds = iou_thresholds
         self.reset()
-    
+
     def reset(self):
-        """Réinitialiser les compteurs"""
-        self.tp_per_class = defaultdict(lambda: defaultdict(int))
-        self.fp_per_class = defaultdict(lambda: defaultdict(int))
-        self.fn_per_class = defaultdict(lambda: defaultdict(int))
-        
-        self.all_ious = []
+        # class_id -> liste de {'score', 'ious': np.array(n_gt,), 'img_idx'}
+        self.detections = defaultdict(list)
+        # class_id -> nombre total d'instances GT
+        self.n_gts = defaultdict(int)
+        self._img_idx = 0
         self.mask_ious = []
-        
-        # Pour segmentation sémantique
+        # Matrice de confusion pour les métriques sémantiques
         self.confusion_matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
-    
+
     def update_semantic(self, pred_mask, gt_mask):
-        """Mettre à jour la matrice de confusion pour segmentation sémantique"""
+        """Mettre à jour la matrice de confusion pour segmentation sémantique."""
         pred_flat = pred_mask.flatten()
         gt_flat = gt_mask.flatten()
-        
         for p, g in zip(pred_flat, gt_flat):
             if g < self.num_classes and p < self.num_classes:
                 self.confusion_matrix[g, p] += 1
-    
+
     def add_image(self, pred_semantic, gt_semantic, gt_instances, gt_labels):
-        """
-        Ajouter une image pour évaluation
-        Compare les instances extraites de la prédiction sémantique avec les GT
-        """
-        
-        # Mettre à jour la matrice de confusion
+        """Ajouter une image pour évaluation (segmentation sémantique → instances)."""
         self.update_semantic(pred_semantic, gt_semantic)
-        
-        # Pour chaque classe (ignorer background)
+
         for class_id in range(1, self.num_classes):
-            # Extraire les instances prédites (composantes connexes)
             pred_instances = extract_connected_components(pred_semantic, class_id)
-            
-            # Instances GT pour cette classe
+
             gt_class_masks = []
             for i, label in enumerate(gt_labels):
                 if label == class_id:
-                    # Redimensionner le masque GT si nécessaire
                     gt_mask = gt_instances[i]
                     if gt_mask.shape != pred_semantic.shape:
                         gt_mask_pil = Image.fromarray(gt_mask.astype(np.uint8))
@@ -303,157 +317,174 @@ class MetricsCalculator:
                         )
                         gt_mask = np.array(gt_mask_pil)
                     gt_class_masks.append(gt_mask)
-            
+
             n_pred = len(pred_instances)
             n_gt = len(gt_class_masks)
-            
-            # Évaluer pour chaque seuil IoU
-            for iou_thresh in self.iou_thresholds:
-                if n_gt == 0 and n_pred == 0:
-                    continue
-                
-                if n_gt == 0:
-                    self.fp_per_class[class_id][iou_thresh] += n_pred
-                    continue
-                
-                if n_pred == 0:
-                    self.fn_per_class[class_id][iou_thresh] += n_gt
-                    continue
-                
-                # Calculer la matrice IoU
-                iou_matrix = np.zeros((n_pred, n_gt))
-                for i, pred_inst in enumerate(pred_instances):
-                    for j, gt_mask in enumerate(gt_class_masks):
-                        iou_val = calculate_iou_masks(pred_inst['mask'], gt_mask)
-                        iou_matrix[i, j] = iou_val
-                        
-                        if iou_thresh == 0.5:
-                            self.mask_ious.append(iou_val)
-                
-                # Matching glouton
-                matched_gt = set()
-                matched_pred = set()
-                
-                # Trier par aire décroissante (simuler score)
-                sorted_indices = sorted(range(n_pred), 
-                                        key=lambda x: pred_instances[x]['area'], 
-                                        reverse=True)
-                
-                for pred_idx in sorted_indices:
-                    best_iou = 0
-                    best_gt = -1
-                    
-                    for gt_idx in range(n_gt):
-                        if gt_idx in matched_gt:
-                            continue
-                        if iou_matrix[pred_idx, gt_idx] > best_iou:
-                            best_iou = iou_matrix[pred_idx, gt_idx]
-                            best_gt = gt_idx
-                    
-                    if best_iou >= iou_thresh:
-                        matched_gt.add(best_gt)
-                        matched_pred.add(pred_idx)
-                        self.tp_per_class[class_id][iou_thresh] += 1
-                    else:
-                        self.fp_per_class[class_id][iou_thresh] += 1
-                
-                self.fn_per_class[class_id][iou_thresh] += n_gt - len(matched_gt)
-    
+            self.n_gts[class_id] += n_gt
+
+            if n_pred == 0:
+                continue
+
+            # Matrice IoU (n_pred x n_gt) — calculée une seule fois par image/classe
+            iou_matrix = np.zeros((n_pred, n_gt))
+            for i, pred_inst in enumerate(pred_instances):
+                for j, gt_mask in enumerate(gt_class_masks):
+                    iou_val = calculate_iou_masks(pred_inst['mask'], gt_mask)
+                    iou_matrix[i, j] = iou_val
+                    self.mask_ious.append(iou_val)
+
+            # L'aire de la composante connexe sert de proxy pour le score de confiance
+            for i, pred_inst in enumerate(pred_instances):
+                self.detections[class_id].append({
+                    'score': float(pred_inst['area']),
+                    'ious': iou_matrix[i].copy(),
+                    'img_idx': self._img_idx
+                })
+
+        self._img_idx += 1
+
+    def _compute_ap(self, class_id, iou_thresh):
+        """AP = aire sous la courbe PR pour une classe à un seuil IoU donné."""
+        n_gt = self.n_gts[class_id]
+        dets = self.detections[class_id]
+        if n_gt == 0 or not dets:
+            return 0.0
+
+        dets_sorted = sorted(dets, key=lambda d: d['score'], reverse=True)
+        matched = defaultdict(set)  # img_idx -> ensemble d'indices GT matchés
+        tp_list, fp_list = [], []
+
+        for d in dets_sorted:
+            ious = d['ious']
+            img_idx = d['img_idx']
+            best_iou, best_j = 0.0, -1
+
+            for j, v in enumerate(ious):
+                if j not in matched[img_idx] and v > best_iou:
+                    best_iou, best_j = v, j
+
+            if best_iou >= iou_thresh:
+                tp_list.append(1); fp_list.append(0)
+                matched[img_idx].add(best_j)
+            else:
+                tp_list.append(0); fp_list.append(1)
+
+        tp_cum = np.cumsum(tp_list, dtype=float)
+        fp_cum = np.cumsum(fp_list, dtype=float)
+        recalls = tp_cum / n_gt
+        precisions = tp_cum / (tp_cum + fp_cum)
+        return calculate_ap(recalls, precisions)
+
+    def _compute_prf(self, class_id, iou_thresh, score_thresh=0.0):
+        """TP/FP/FN et Precision/Recall/F1 (score_thresh=0 : toutes les composantes incluses)."""
+        n_gt = self.n_gts[class_id]
+        dets = [d for d in self.detections[class_id] if d['score'] >= score_thresh]
+        n_pred = len(dets)
+
+        if n_gt == 0 and n_pred == 0:
+            return {'TP': 0, 'FP': 0, 'FN': 0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+        if n_gt == 0:
+            return {'TP': 0, 'FP': n_pred, 'FN': 0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+        if n_pred == 0:
+            return {'TP': 0, 'FP': 0, 'FN': n_gt, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0}
+
+        dets_sorted = sorted(dets, key=lambda d: d['score'], reverse=True)
+        matched = defaultdict(set)
+        tp = fp = 0
+
+        for d in dets_sorted:
+            ious = d['ious']
+            img_idx = d['img_idx']
+            best_iou, best_j = 0.0, -1
+
+            for j, v in enumerate(ious):
+                if j not in matched[img_idx] and v > best_iou:
+                    best_iou, best_j = v, j
+
+            if best_iou >= iou_thresh:
+                tp += 1; matched[img_idx].add(best_j)
+            else:
+                fp += 1
+
+        fn = n_gt - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        return {'TP': tp, 'FP': fp, 'FN': fn,
+                'Precision': precision, 'Recall': recall, 'F1': f1}
+
     def compute_metrics(self):
-        """Calculer toutes les métriques finales (identique à Mask R-CNN)"""
-        
-        results = {
-            'per_class': {},
-            'overall': {},
-            'iou_stats': {},
-            'semantic': {}
-        }
-        
-        # ========== Métriques par instance (comme Mask R-CNN) ==========
-        
+        """Calculer toutes les métriques finales."""
+        results = {'per_class': {}, 'overall': {}, 'iou_stats': {}, 'semantic': {}}
+
+        # --- AP et PRF par classe ---
         for class_id in range(1, self.num_classes):
             class_name = self.class_names[class_id]
             results['per_class'][class_name] = {}
-            
             for iou_thresh in self.iou_thresholds:
-                tp = self.tp_per_class[class_id][iou_thresh]
-                fp = self.fp_per_class[class_id][iou_thresh]
-                fn = self.fn_per_class[class_id][iou_thresh]
-                
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-                
-                results['per_class'][class_name][f'iou_{iou_thresh}'] = {
-                    'TP': tp,
-                    'FP': fp,
-                    'FN': fn,
-                    'Precision': precision,
-                    'Recall': recall,
-                    'F1': f1
-                }
-        
-        # Métriques globales par seuil IoU
+                prf = self._compute_prf(class_id, iou_thresh, score_thresh=0.0)
+                prf['AP'] = self._compute_ap(class_id, iou_thresh)
+                results['per_class'][class_name][f'iou_{iou_thresh}'] = prf
+
+        # --- Métriques globales micro-moyennées ---
         for iou_thresh in self.iou_thresholds:
-            total_tp = sum(self.tp_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            total_fp = sum(self.fp_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            total_fn = sum(self.fn_per_class[c][iou_thresh] for c in range(1, self.num_classes))
-            
-            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
+            total_tp = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['TP']
+                           for c in range(1, self.num_classes))
+            total_fp = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['FP']
+                           for c in range(1, self.num_classes))
+            total_fn = sum(results['per_class'][self.class_names[c]][f'iou_{iou_thresh}']['FN']
+                           for c in range(1, self.num_classes))
+            precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+            recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
             results['overall'][f'iou_{iou_thresh}'] = {
-                'TP': total_tp,
-                'FP': total_fp,
-                'FN': total_fn,
-                'Precision': precision,
-                'Recall': recall,
-                'F1': f1
+                'TP': total_tp, 'FP': total_fp, 'FN': total_fn,
+                'Precision': precision, 'Recall': recall, 'F1': f1
             }
-        
-        # mAP@50
-        results['mAP50'] = results['overall']['iou_0.5']['Precision']
-        
-        # mAP@50:95
-        precisions_all = [results['overall'][f'iou_{t}']['Precision'] for t in self.iou_thresholds]
-        results['mAP50_95'] = np.mean(precisions_all)
-        
-        # mAP par classe
+
+        # --- mAP@50 = moyenne de AP@50 sur toutes les classes ---
+        results['mAP50'] = float(np.mean([
+            results['per_class'][self.class_names[c]]['iou_0.5']['AP']
+            for c in range(1, self.num_classes)
+        ]))
+
+        # --- mAP@50:95 = moyenne de AP sur toutes les classes ET tous les seuils ---
+        results['mAP50_95'] = float(np.mean([
+            results['per_class'][self.class_names[c]][f'iou_{t}']['AP']
+            for c in range(1, self.num_classes)
+            for t in self.iou_thresholds
+        ]))
+
+        # --- AP par classe ---
         results['mAP_per_class'] = {}
         for class_id in range(1, self.num_classes):
             class_name = self.class_names[class_id]
-            precisions = [
-                results['per_class'][class_name][f'iou_{t}']['Precision']
-                for t in self.iou_thresholds
-            ]
             results['mAP_per_class'][class_name] = {
-                'AP50': results['per_class'][class_name]['iou_0.5']['Precision'],
-                'AP50_95': np.mean(precisions)
+                'AP50': results['per_class'][class_name]['iou_0.5']['AP'],
+                'AP50_95': float(np.mean([
+                    results['per_class'][class_name][f'iou_{t}']['AP']
+                    for t in self.iou_thresholds
+                ]))
             }
-        
-        # Stats IoU
+
+        # --- Stats IoU ---
         if self.mask_ious:
-            results['iou_stats']['mask_iou_mean'] = np.mean(self.mask_ious)
-            results['iou_stats']['mask_iou_std'] = np.std(self.mask_ious)
-            results['iou_stats']['mask_iou_median'] = np.median(self.mask_ious)
-        
-        # ========== Métriques sémantiques (bonus) ==========
-        
+            results['iou_stats']['mask_iou_mean'] = float(np.mean(self.mask_ious))
+            results['iou_stats']['mask_iou_std'] = float(np.std(self.mask_ious))
+            results['iou_stats']['mask_iou_median'] = float(np.median(self.mask_ious))
+
+        # --- Métriques sémantiques ---
         cm = self.confusion_matrix
-        
-        # mIoU sémantique
         intersection = np.diag(cm)
         union = cm.sum(axis=1) + cm.sum(axis=0) - intersection
         iou_per_class = intersection / (union + 1e-10)
         valid_classes = cm.sum(axis=1) > 0
-        
         results['semantic']['mIoU'] = float(np.mean(iou_per_class[valid_classes]))
         results['semantic']['pixel_accuracy'] = float(np.diag(cm).sum() / (cm.sum() + 1e-10))
         results['semantic']['iou_per_class'] = {
             self.class_names[i]: float(iou_per_class[i]) for i in range(self.num_classes)
         }
-        
+
         return results
 
 
