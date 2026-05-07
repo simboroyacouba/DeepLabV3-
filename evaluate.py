@@ -158,21 +158,65 @@ class EvalDataset(torch.utils.data.Dataset):
 
 
 # =============================================================================
+# MÉCANISME D'ATTENTION (CBAM) — doit correspondre à train.py
+# =============================================================================
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(),
+            nn.Linear(mid, channels, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        avg   = self.fc(self.avg_pool(x).view(b, c))
+        mx    = self.fc(self.max_pool(x).view(b, c))
+        return x * self.sigmoid(avg + mx).view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv    = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg   = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.channel_att = ChannelAttention(channels, reduction)
+        self.spatial_att = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        return self.spatial_att(self.channel_att(x))
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
-def get_model(num_classes, backbone="resnet50"):
-    """Créer le modèle DeepLabV3+"""
-    
+def _build_base_model(num_classes, backbone="resnet50"):
     if backbone == "resnet50":
         model = deeplabv3_resnet50(weights=None)
         in_channels = 2048
     elif backbone == "resnet101":
         model = deeplabv3_resnet101(weights=None)
         in_channels = 2048
-    
+    else:
+        raise ValueError(f"Backbone inconnu: {backbone}")
     model.classifier = DeepLabHead(in_channels, num_classes)
-    
     if model.aux_classifier is not None:
         model.aux_classifier = nn.Sequential(
             nn.Conv2d(1024, 256, 3, padding=1, bias=False),
@@ -181,38 +225,70 @@ def get_model(num_classes, backbone="resnet50"):
             nn.Dropout(0.1),
             nn.Conv2d(256, num_classes, 1)
         )
-    
+    return model
+
+
+def _build_attention_model(num_classes, backbone="resnet50",
+                           cbam_reduction=16, cbam_kernel_size=7):
+    model = _build_base_model(num_classes, backbone)
+    layers = list(model.classifier.children())
+    model.classifier = nn.Sequential(
+        *layers[:4],
+        CBAM(256, cbam_reduction, cbam_kernel_size),
+        layers[4],
+    )
     return model
 
 
 def load_model(model_path, num_classes, backbone, device):
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = checkpoint['model_state_dict']
-    
-    # ✅ Détecter num_classes depuis le checkpoint
-    detected_classes = state_dict['classifier.4.weight'].shape[0]
+
+    # Détecter l'architecture (simple vs attention) selon les clés présentes
+    has_cbam = 'classifier.5.weight' in state_dict
+    final_key = 'classifier.5.weight' if has_cbam else 'classifier.4.weight'
+
+    if final_key not in state_dict:
+        raise KeyError(f"Clé finale de classification introuvable dans le checkpoint. "
+                       f"Clés classifier.*: {[k for k in state_dict if k.startswith('classifier')]}")
+
+    detected_classes = state_dict[final_key].shape[0]
     if detected_classes != num_classes:
         print(f"⚠️ num_classes corrigé: {num_classes} → {detected_classes}")
         num_classes = detected_classes
-    
-    # ✅ Détecter aux_classifier
+
     has_aux = any(k.startswith('aux_classifier') for k in state_dict.keys())
-    
-    model = get_model(num_classes, backbone)
-    
+
+    if has_cbam:
+        # Récupérer les hyperparamètres CBAM depuis le checkpoint si disponibles
+        model_config     = checkpoint.get('model_config', {})
+        cbam_reduction   = model_config.get('cbam_reduction',   16)
+        cbam_kernel_size = model_config.get('cbam_kernel_size',  7)
+        # Fallback: déduire depuis le state_dict
+        if 'classifier.4.channel_att.fc.0.weight' in state_dict:
+            mid = state_dict['classifier.4.channel_att.fc.0.weight'].shape[0]
+            cbam_reduction = max(1, 256 // mid)
+        if 'classifier.4.spatial_att.conv.weight' in state_dict:
+            cbam_kernel_size = state_dict['classifier.4.spatial_att.conv.weight'].shape[2]
+        model = _build_attention_model(num_classes, backbone, cbam_reduction, cbam_kernel_size)
+        print(f"   Architecture: DeepLabV3+ + CBAM(reduction={cbam_reduction}, kernel={cbam_kernel_size})")
+    else:
+        model = _build_base_model(num_classes, backbone)
+        print(f"   Architecture: DeepLabV3+ standard")
+
     if has_aux and model.aux_classifier is None:
         model.aux_classifier = nn.Sequential(
             nn.Conv2d(1024, 256, 3, padding=1, bias=False),
             nn.BatchNorm2d(256), nn.ReLU(), nn.Dropout(0.1),
             nn.Conv2d(256, num_classes, 1)
         )
-    
+
     model.load_state_dict(state_dict)
     model.aux_classifier = None  # inutile à l'évaluation
     model.to(device)
     model.eval()
-    
-    print(f"✅ Modèle chargé: {model_path} (epoch={checkpoint.get('epoch', 'N/A')}, aux={has_aux})")
+
+    print(f"✅ Modèle chargé: {model_path} (epoch={checkpoint.get('epoch', 'N/A')})")
     return model
 
 
@@ -331,7 +407,12 @@ class MetricsCalculator:
                 for j, gt_mask in enumerate(gt_class_masks):
                     iou_val = calculate_iou_masks(pred_inst['mask'], gt_mask)
                     iou_matrix[i, j] = iou_val
-                    self.mask_ious.append(iou_val)
+
+            # IoU stats: meilleure correspondance GT par prédiction
+            if n_gt > 0:
+                for i in range(n_pred):
+                    best_j = int(np.argmax(iou_matrix[i]))
+                    self.mask_ious.append(iou_matrix[i, best_j])
 
             # L'aire de la composante connexe sert de proxy pour le score de confiance
             for i, pred_inst in enumerate(pred_instances):

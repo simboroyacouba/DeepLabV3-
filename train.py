@@ -137,20 +137,31 @@ class TrainingTimer:
 # AUGMENTATION PAR CLASSE
 # =============================================================================
 
-def load_aug_coefficients(classes):
+def parse_aug_coeffs(aug_args, classes):
     """
-    Charge les coefficients d'augmentation depuis les variables d'environnement.
-    Format index  : CLASS_AUG_1=2  (1 = première classe hors __background__)
-    Format nom    : CLASS_AUG_TOITURE_TOLE_BAC=2
+    Parse les coefficients d'augmentation depuis les arguments CLI.
+    Format: nom_partiel:coeff  (ex: --aug dalle:2 tole:3)
+    Correspondance partielle insensible à la casse sur le nom de classe.
     Valeur par défaut: 1 (aucune augmentation).
     """
     real_classes = [c for c in classes if c != '__background__']
-    coeffs = {}
-    for i, cls in enumerate(real_classes, 1):
-        env_idx  = f"CLASS_AUG_{i}"
-        env_name = "CLASS_AUG_" + cls.upper().replace(' ', '_').replace('-', '_')
-        raw = os.getenv(env_name) or os.getenv(env_idx, "1")
-        coeffs[cls] = max(1, int(raw))
+    coeffs = {cls: 1 for cls in real_classes}
+    for item in (aug_args or []):
+        if ':' not in item:
+            print(f"⚠️  Format invalide (ignoré): {item!r} — attendu: classe:coeff")
+            continue
+        key, val = item.rsplit(':', 1)
+        try:
+            coeff = max(1, int(val))
+        except ValueError:
+            print(f"⚠️  Coefficient invalide (ignoré): {val!r}")
+            continue
+        matched = [c for c in real_classes if key.lower() in c.lower()]
+        if not matched:
+            print(f"⚠️  Classe non trouvée (ignorée): {key!r}  — classes dispo: {real_classes}")
+            continue
+        for cls in matched:
+            coeffs[cls] = coeff
     return coeffs
 
 
@@ -331,6 +342,9 @@ class ChannelAttention(nn.Module):
             nn.Linear(mid, channels, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
+        # Zéro-init de la dernière couche : sigmoid(0)=0.5 uniforme au départ
+        # → gradient propre dès la 1ère epoch, CBAM diverge vite du modèle simple
+        nn.init.zeros_(self.fc[-1].weight)
 
     def forward(self, x):
         b, c = x.shape[:2]
@@ -344,6 +358,7 @@ class SpatialAttention(nn.Module):
         super().__init__()
         self.conv    = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
+        nn.init.zeros_(self.conv.weight)
 
     def forward(self, x):
         avg   = x.mean(dim=1, keepdim=True)
@@ -687,6 +702,8 @@ Modes disponibles:
                         choices=[3, 5, 7])
     parser.add_argument("--backbone", default=CONFIG["backbone"],
                         choices=["resnet50", "resnet101"])
+    parser.add_argument("--aug", nargs='*', default=[], metavar='CLASSE:COEFF',
+                        help="Coefficients d'augmentation par classe (ex: --aug dalle:2 tole:3)")
     args = parser.parse_args()
 
     OPTUNA_CONFIG["n_trials"]           = args.n_trials
@@ -706,8 +723,8 @@ Modes disponibles:
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
-    # ── Coefficients d'augmentation (depuis ENV vars) ────────────────────────
-    aug_coeffs = load_aug_coefficients(CONFIG["classes"])
+    # ── Coefficients d'augmentation (depuis arguments CLI) ──────────────────
+    aug_coeffs = parse_aug_coeffs(args.aug, CONFIG["classes"])
 
     print("\nChargement du dataset...")
     _coco_ref = COCO(CONFIG["annotations_file"])
